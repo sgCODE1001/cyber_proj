@@ -1,0 +1,726 @@
+# security_dataset_generator.py
+# Generates a JSONL dataset for LLM training:
+# fields: {code, language, error_name, vulnerable}
+# Covers: Python, C, C++, Java, JavaScript
+# Vulns: Buffer Overflow, SQL Injection, Command Injection, Use-after-free,
+#        Hardcoded Credentials, XSS, Null Pointer, Integer Overflow,
+#        Insecure Deserialization, Resource Leak
+
+
+
+#first ds (js, py, java, c++, c --> 10 errors)
+
+
+import random, json, itertools
+
+# ----------- CONFIG -----------
+RANDOM_SEED = 1337
+SHORT_VARIANTS_PER_TEMPLATE = 80     # per (lang, vuln, safe|unsafe) template
+LONG_VARIANTS_PER_TEMPLATE  = 40
+OUTPUT_JSONL = "security_dataset_all_langs.jsonl"
+
+random.seed(RANDOM_SEED)
+
+# ----------- UTILS: human-like noise & naming -----------
+
+# Large-ish pools of human-ish variable names, with typos & styles
+NAME_POOLS = {
+    "generic": [
+        "data","input","inpt","usr_input","userInput","param","prm","arg","args","payload",
+        "name","username","usrname","id","user_id","uid","qid","val","value","cnt","count","idx","index",
+        "buf","buffer","tmpBuf","tmp","tmp1","tmp2","tmp_val","b","arr","array","lst","list","numbers",
+        "cmd","command","cmdStr","shell_cmd","arg0","a0","opt","option","flag","flg","path","pth","file","filePath",
+        "ptr","pointer","p","px","ref","obj","myObj","instance","inst","ctx","context","cfg","conf","config",
+        "password","passwd","pwd","secret","token","tok","key","apikey","api_key","env","envvar",
+        "cursor","cur","c","stmt","statement","st","sql","qry","query","q","res","result","row","rows",
+        "json","doc","docStr","text","txt","str","s","t","x","y","z","n","m"
+    ],
+    "python": [
+        "cursor","cur","conn","db","engine","sess","session",
+        "f","fp","fh","file","path","pth","line","ln","content","contents",
+        "user_input","unsafe","clean","safe","sanitized","unsanitized",
+        "cmd","cmd_parts","cmdline","args","argv"
+    ],
+    "c_family": [
+        "buf","buffer","arr","arr1","arr2","b","tmp","tmpBuf","input","inData","inpt","src","dst",
+        "ptr","p","px","pp","ptr1","ptr2",
+        "len","n","i","j","k","idx","count","cap","size","sz","capacity",
+        "query","q","stmt","res","row","name","id","pwd","pass","password"
+    ],
+    "java": [
+        "conn","stmt","ps","rs","q","sql","userInput","name","id","value","v","path","file","fis",
+        "br","line","sb","builder","cmd","args","proc","pb","process","scanner"
+    ],
+    "js": [
+        "req","res","db","client","pool","query","sql","params","name","id","val","value",
+        "input","userInput","unsafe","cmd","cp","child","payload","body"
+    ],
+}
+
+COMMENT_POOL = [
+    "TODO","fixme","DEBUG","temporary","refactor later","check bounds","needs tests",
+    "quick hack","unsafe?","review","optimize","hot path","legacy"
+]
+
+DOCSTRINGS = [
+    '"""process data quickly"""',
+    '"""utility function"""',
+    '"""NOTE: auto-generated"""',
+    '"""experimental"""'
+]
+
+def pick_name(lang_hint=None):
+    base = random.choice(NAME_POOLS["generic"])
+    # mix in language pool ~50% time
+    if lang_hint and random.random() < 0.5:
+        lang_pool = NAME_POOLS.get(lang_hint, [])
+        if lang_pool:
+            base = random.choice(lang_pool)
+    # random casing/snake/camel variants
+    variants = [
+        base,
+        base.lower(),
+        base.upper(),
+        base.capitalize(),
+        base.replace("_",""),
+        base.replace("_","").capitalize(),
+    ]
+    # add suffix/prefix sometimes
+    if random.random() < 0.35:
+        variants.append(base + str(random.choice([1,2,3,42,99])))
+    if random.random() < 0.25:
+        variants.append("tmp_" + base)
+    return random.choice(variants)
+
+def maybe_spaces(s):
+    # sprinkle spaces around operators
+    s = s.replace("=", random.choice(["=", " = ", "  ="]))
+    s = s.replace("+", random.choice(["+", " + ", " +"]))
+    s = s.replace("(", random.choice(["(", "( ", "("]))
+    s = s.replace(")", random.choice([")", " )", ")"]))
+    s = s.replace(",", random.choice([",", ", ", " , "]))
+    return s
+
+def maybe_comment(line, prefix="//"):
+    if random.random() < 0.25:
+        c = random.choice(COMMENT_POOL)
+        # choose inline or next-line
+        if random.random() < 0.5:
+            return f"{line}  {prefix} {c}"
+        else:
+            return f"{prefix} {c}\n{line}"
+    return line
+
+def maybe_blank_lines(code):
+    # insert occasional blank lines
+    out = []
+    for ln in code.splitlines():
+        out.append(ln)
+        if random.random() < 0.08:
+            out.append("")
+    return "\n".join(out)
+
+def indent(block, n=4, ch=" "):
+    pad = ch * n
+    return "\n".join(pad + ln if ln.strip() else ln for ln in block.splitlines())
+
+def py_wrap_long(body):
+    # wrap a snippet into a longer Python function/script (~10–20 lines)
+    fn = pick_name("python")
+    arg = pick_name("python")
+    ds = random.choice(DOCSTRINGS)
+    pre = [
+        "import os",
+        "import sys",
+        "import subprocess",
+        "import json",
+        "",
+        f"def {fn}({arg}):",
+        f"    {ds}",
+        "    cfg = {'mode': 'dev', 'retry': 1}",
+        "    total = 0",
+        "    for i in range(3):",
+        "        total += i",
+        "    # core operation"
+    ]
+    post = [
+        "    # finalize",
+        "    print('done', total)",
+        "",
+        f"if __name__ == '__main__':",
+        f"    {fn}({random.choice(['sys.argv','{}','None'])})"
+    ]
+    return "\n".join(pre + [indent(body, 4)] + post)
+
+def c_wrap_long(body, lang="C"):
+    # wrap into a full-ish C/C++ program
+    inc = ["#include <stdio.h>", "#include <stdlib.h>", "#include <string.h>"]
+    if lang == "C++":
+        inc = ["#include <iostream>", "#include <cstring>", "#include <cstdlib>"]
+    helper = """
+int helper(int n){
+    int s = 0;
+    for(int i=0;i<n;i++){ s += i; }
+    return s;
+}
+""".strip()
+    main_header = "int main(int argc, char** argv){" if lang == "C" else "int main(int argc, char** argv){"
+    out = "\n".join(inc) + "\n\n" + helper + "\n\n" + main_header + "\n"
+    out += indent("// setup\nint total = helper(5);\n" + body + "\nprintf(\"%d\\n\", total);\n", 4)
+    out += "}\n"
+    if lang == "C++":
+        out = out.replace('printf("%d\\n", total);', 'std::cout << total << std::endl;')
+    return out
+
+def java_wrap_long(body):
+    cls = (pick_name("java").replace("_","").capitalize() or "App")
+    m = pick_name("java")
+    pre = f"""
+import java.io.*;
+import java.util.*;
+public class {cls} {{
+    static int helper(int n){{
+        int s=0;
+        for(int i=0;i<n;i++) s+=i;
+        return s;
+    }}
+    public static void main(String[] args) throws Exception {{
+        int total = helper(5);
+""".strip("\n")
+    post = """
+        System.out.println(total);
+    }
+}
+""".strip("\n")
+    return pre + "\n" + indent("// core\n" + body, 8) + "\n" + post
+
+def js_wrap_long(body):
+    fn = pick_name("js")
+    pre = f"""
+function {fn}(data) {{
+    let total = 0;
+    for (let i=0;i<3;i++) total += i;
+    // core
+""".strip("\n")
+    post = """
+    console.log("done", total);
+}
+"""[1:]
+    return pre + "\n" + indent(body, 4) + "\n" + post
+
+def finalize_line(line, lang):
+    # per-language comments and spacing
+    if lang in ("C","C++","Java","JavaScript"):
+        line = maybe_comment(maybe_spaces(line), prefix="//")
+    elif lang == "Python":
+        line = maybe_comment(maybe_spaces(line), prefix="#")
+    return line
+
+def finalize_block(block, lang):
+    lines = block.splitlines()
+    lines = [finalize_line(ln, lang) if ln.strip() else ln for ln in lines]
+    code = "\n".join(lines)
+    code = maybe_blank_lines(code)
+    return code
+
+# ----------- VULNERABILITY TEMPLATES (unsafe vs safe), per language -----------
+
+# Placeholders in braces {var} get replaced by pick_name(lang_hint)
+# Keep them generic enough; not all snippets must compile — they just need to look realistic.
+
+TEMPLATES = {
+    "Buffer Overflow": {
+        "C": {
+            "unsafe": [
+                "char {buf}[10]; strcpy({buf}, {input});",
+                "char {buf}[8]; gets({buf});",
+                "char {dst}[16]; char {src}[64]; strcpy({dst}, {src});"
+            ],
+            "safe": [
+                "char {buf}[10]; strncpy({buf}, {input}, sizeof({buf})-1); {buf}[sizeof({buf})-1] = '\\0';",
+                "char {buf}[8]; fgets({buf}, sizeof({buf}), stdin);",
+                "char {dst}[16]; char {src}[64]; strncpy({dst}, {src}, sizeof({dst})-1); {dst}[15]='\\0';"
+            ]
+        },
+        "C++": {
+            "unsafe": [
+                "char {buf}[10]; std::strcpy({buf}, {input});",
+                "char {buf}[8]; gets({buf}); // legacy"
+            ],
+            "safe": [
+                "char {buf}[10]; std::strncpy({buf}, {input}, sizeof({buf})-1); {buf}[9]='\\0';",
+                "std::string {dst} = std::string({input}).substr(0, 7);"
+            ]
+        },
+        "Python": {
+            "unsafe": [
+                "{lst} = [0]*10\n{lst}[15] = 5"
+            ],
+            "safe": [
+                "{lst} = [0]*10\nif {idx} < len({lst}):\n    {lst}[{idx}] = 5"
+            ]
+        },
+        "Java": {"unsafe": [], "safe": []},  # N/A traditionally; left empty
+        "JavaScript": {"unsafe": [], "safe": []}, # N/A
+    },
+
+    "SQL Injection": {
+        "Python": {
+            "unsafe": [
+                '{cursor}.execute("SELECT * FROM users WHERE name=\\"" + {user_input} + "\\"" )',
+                '{cursor}.execute("DELETE FROM accounts WHERE id=" + str({user_input}))'
+            ],
+            "safe": [
+                '{cursor}.execute("SELECT * FROM users WHERE name=%s", ({user_input},))',
+                '{cursor}.execute("DELETE FROM accounts WHERE id=%s", ({user_input},))'
+            ]
+        },
+        "Java": {
+            "unsafe": [
+                '{stmt}.execute("SELECT * FROM users WHERE name=\'" + {user_input} + "\'");',
+                'String q = "DELETE FROM accounts WHERE id=" + {user_input}; {stmt}.execute(q);'
+            ],
+            "safe": [
+                'PreparedStatement ps = conn.prepareStatement("SELECT * FROM users WHERE name=?"); ps.setString(1, {user_input}); ps.execute();',
+                'PreparedStatement ps = conn.prepareStatement("DELETE FROM accounts WHERE id=?"); ps.setInt(1, {user_input}); ps.execute();'
+            ]
+        },
+        "JavaScript": {
+            "unsafe": [
+                '{db}.query("SELECT * FROM users WHERE name=\'" + {user_input} + "\'");',
+                'let sql = "DELETE FROM accounts WHERE id=" + {user_input}; {db}.query(sql);'
+            ],
+            "safe": [
+                '{db}.query("SELECT * FROM users WHERE name=$1", [{user_input}]);',
+                'let sql = "DELETE FROM accounts WHERE id=$1"; {db}.query(sql, [{user_input}]);'
+            ]
+        },
+        "C": {
+            "unsafe": [
+                'char query[256]; sprintf(query, "SELECT * FROM users WHERE id=%s", {input}); sqlite3_exec(db, query, 0, 0, 0);'
+            ],
+            "safe": [
+                'sqlite3_prepare_v2(db, "SELECT * FROM users WHERE id=?", -1, &stmt, 0); sqlite3_bind_text(stmt, 1, {input}, -1, SQLITE_STATIC); sqlite3_step(stmt);'
+            ]
+        },
+        "C++": {
+            "unsafe": [
+                'char query[256]; std::sprintf(query, "SELECT * FROM users WHERE id=%s", {input}); sqlite3_exec(db, query, 0, 0, 0);'
+            ],
+            "safe": [
+                'sqlite3_prepare_v2(db, "SELECT * FROM users WHERE id=?", -1, &stmt, 0); sqlite3_bind_text(stmt, 1, {input}, -1, SQLITE_STATIC); sqlite3_step(stmt);'
+            ]
+        }
+    },
+
+    "Command Injection": {
+        "Python": {
+            "unsafe": [
+                'os.system("ls " + {cmd})',
+                'os.popen("ping " + {cmd}).read()'
+            ],
+            "safe": [
+                'subprocess.run(["ls", {cmd}])',
+                'subprocess.run(["ping", {cmd}], check=True)'
+            ]
+        },
+        "Java": {
+            "unsafe": [
+                'Runtime.getRuntime().exec("ls " + {cmd});',
+                'Runtime.getRuntime().exec("ping " + {cmd});'
+            ],
+            "safe": [
+                'ProcessBuilder pb = new ProcessBuilder("ls", {cmd}); pb.start();',
+                'ProcessBuilder pb = new ProcessBuilder("ping", {cmd}); pb.start();'
+            ]
+        },
+        "JavaScript": {
+            "unsafe": [
+                'require("child_process").exec("ls " + {cmd});',
+                'require("child_process").exec("ping " + {cmd});'
+            ],
+            "safe": [
+                'require("child_process").execFile("ls", [{cmd}]);',
+                'require("child_process").execFile("ping", [{cmd}]);'
+            ]
+        },
+        "C": {
+            "unsafe": [
+                'char syscmd[256]; sprintf(syscmd, "ls %s", {cmd}); system(syscmd);'
+            ],
+            "safe": [
+                '// safer: avoid shell; validate input length\nif(strlen({cmd})<200){ /* execute via library or whitelist */ }'
+            ]
+        },
+        "C++": {
+            "unsafe": [
+                'char syscmd[256]; std::sprintf(syscmd, "ping %s", {cmd}); system(syscmd);'
+            ],
+            "safe": [
+                '// safer: avoid shell; use platform APIs or validation'
+            ]
+        }
+    },
+
+    "Use-after-free": {
+        "C": {
+            "unsafe": [
+                'free({ptr}); printf("%s", {ptr});',
+                'free({ptr}); {ptr}[0] = \'A\';'
+            ],
+            "safe": [
+                'free({ptr}); {ptr} = NULL;',
+                'if ({ptr}) free({ptr}); {ptr} = NULL;'
+            ]
+        },
+        "C++": {
+            "unsafe": [
+                'delete {ptr}; std::cout << *{ptr};',
+                'free({ptr}); std::cout << {ptr};'
+            ],
+            "safe": [
+                'delete {ptr}; {ptr} = nullptr;',
+                'if ({ptr}) {{ delete {ptr}; {ptr} = nullptr; }}'
+            ]
+        },
+        "Python": {"unsafe": [], "safe": []},
+        "Java": {"unsafe": [], "safe": []},
+        "JavaScript": {"unsafe": [], "safe": []},
+    },
+
+    "Hardcoded Credentials": {
+        "Python": {
+            "unsafe": [
+                '{password} = "1234"',
+                '{password} = "admin_password"'
+            ],
+            "safe": [
+                '{password} = os.getenv("APP_PASSWORD")',
+                '{password} = json.loads(open("config.json").read()).get("password")'
+            ]
+        },
+        "Java": {
+            "unsafe": [
+                'String {password} = "root123";'
+            ],
+            "safe": [
+                'String {password} = System.getenv("DB_PASS");',
+                'Properties p = new Properties(); p.load(new FileInputStream("app.properties")); String {password} = p.getProperty("db.pass");'
+            ]
+        },
+        "JavaScript": {
+            "unsafe": [
+                'const {password} = "1234";',
+                'let {password} = "secret";'
+            ],
+            "safe": [
+                'const {password} = process.env.DB_PASS;',
+                'const {password} = JSON.parse(require("fs").readFileSync("config.json")).password;'
+            ]
+        },
+        "C": {
+            "unsafe": [
+                'char* {password} = "1234";'
+            ],
+            "safe": [
+                '// read from file or env\nchar* {password} = getenv("APP_PASSWORD");'
+            ]
+        },
+        "C++": {
+            "unsafe": [
+                'std::string {password} = "admin";'
+            ],
+            "safe": [
+                '// read from env or config\nconst char* envp = std::getenv("APP_PASSWORD"); std::string {password} = envp? envp : "";'
+            ]
+        }
+    },
+
+    "XSS": {
+        "JavaScript": {
+            "unsafe": [
+                'element.innerHTML = {user_input};',
+                'document.write({user_input});'
+            ],
+            "safe": [
+                'element.textContent = {user_input};',
+                'element.innerHTML = escapeHtml({user_input});'
+            ]
+        },
+        "Python": {
+            "unsafe": [
+                'innerHTML = {user_input}  # pretend DOM'
+            ],
+            "safe": [
+                'textContent = sanitize({user_input})'
+            ]
+        },
+        "C": {"unsafe": [], "safe": []},
+        "C++": {"unsafe": [], "safe": []},
+        "Java": {"unsafe": [], "safe": []},
+    },
+
+    "Null Pointer": {
+        "C": {
+            "unsafe": [
+                '{ptr}->method();',
+                'printf("%s", {ptr});'
+            ],
+            "safe": [
+                'if ({ptr}) {ptr}->method();',
+                'if ({ptr} != NULL) printf("%s", {ptr});'
+            ]
+        },
+        "C++": {
+            "unsafe": [
+                '{ptr}->doStuff();'
+            ],
+            "safe": [
+                'if ({ptr} != nullptr) {ptr}->doStuff();'
+            ]
+        },
+        "Java": {
+            "unsafe": [
+                '{obj}.method();'
+            ],
+            "safe": [
+                'if ({obj} != null) {obj}.method();'
+            ]
+        },
+        "Python": {
+            "unsafe": [
+                '{obj}.method()'
+            ],
+            "safe": [
+                'if {obj} is not None:\n    {obj}.method()'
+            ]
+        },
+        "JavaScript": {
+            "unsafe": [
+                '{obj}.method();'
+            ],
+            "safe": [
+                'if ({obj}) {obj}.method();'
+            ]
+        }
+    },
+
+    "Integer Overflow": {
+        "C": {
+            "unsafe": [
+                'uint8_t {x}=255; {x}+={val};',
+                'unsigned char {x}=250; {x}+=10;'
+            ],
+            "safe": [
+                'uint16_t {x}=255; {x}+={val};',
+                'unsigned int {x}=250; {x}+=10;'
+            ]
+        },
+        "C++": {
+            "unsafe": [
+                'uint8_t {x}=255; {x}+={val};'
+            ],
+            "safe": [
+                'unsigned int {x}=255; {x}+={val};'
+            ]
+        },
+        "Java": {
+            "unsafe": [
+                'int {x} = Integer.MAX_VALUE + 1;'
+            ],
+            "safe": [
+                'long {x} = (long) Integer.MAX_VALUE + 1;'
+            ]
+        },
+        "JavaScript": {
+            "unsafe": [
+                'let {x} = Number.MAX_SAFE_INTEGER + 10;'
+            ],
+            "safe": [
+                'let {x} = BigInt(Number.MAX_SAFE_INTEGER) + 10n;'
+            ]
+        },
+        "Python": {
+            "unsafe": [
+                '{x} = 255 + 10'
+            ],
+            "safe": [
+                '{x} = 255 + 10  # Python ints arbitrary precision; no overflow'
+            ]
+        }
+    },
+
+    "Insecure Deserialization": {
+        "Python": {
+            "unsafe": [
+                'pickle.load({user_input})',
+                'pickle.loads({user_input})'
+            ],
+            "safe": [
+                'json.loads({safe_data})',
+                'pickle.loads({safe_data}, fix_imports=False)'
+            ]
+        },
+        "Java": {
+            "unsafe": [
+                'ObjectInputStream in = new ObjectInputStream({user_input});'
+            ],
+            "safe": [
+                'JsonObject obj = gson.fromJson({safe_data}, JsonObject.class);'
+            ]
+        },
+        "JavaScript": {
+            "unsafe": [
+                'eval("(" + {user_input} + ")")'
+            ],
+            "safe": [
+                'JSON.parse({safe_data})'
+            ]
+        },
+        "C": {"unsafe": [], "safe": []},
+        "C++": {"unsafe": [], "safe": []},
+    },
+
+    "Resource Leak": {
+        "Python": {
+            "unsafe": [
+                '{f} = open("data.txt")\n{data} = {f}.read()',
+                'fp = open("config.json")\nconfig = fp.read()  # missing close'
+            ],
+            "safe": [
+                'with open("data.txt") as {f}:\n    {data} = {f}.read()',
+                'with open("config.json") as fh:\n    config = fh.read()'
+            ]
+        },
+        "Java": {
+            "unsafe": [
+                'FileInputStream {fis} = new FileInputStream("file.txt");\nbyte[] buf = new byte[1024];\n{fis}.read(buf);  // not closed'
+            ],
+            "safe": [
+                'try (FileInputStream {fis} = new FileInputStream("file.txt")) {\n    byte[] buf = new byte[1024];\n    {fis}.read(buf);\n}'
+            ]
+        },
+        "C": {
+            "unsafe": [
+                'FILE* {fp} = fopen("file.txt","r"); char buf[128]; fread(buf,1,128,{fp}); // no fclose'
+            ],
+            "safe": [
+                'FILE* {fp} = fopen("file.txt","r"); if({fp}){{ char buf[128]; fread(buf,1,128,{fp}); fclose({fp}); }}'
+            ]
+        },
+        "C++": {
+            "unsafe": [
+                'std::ifstream {ifs}("file.txt"); std::string s; {ifs} >> s; // RAII usually closes, but simulate improper handling'
+            ],
+            "safe": [
+                '{\n    std::ifstream {ifs}("file.txt");\n    std::string s; {ifs} >> s;\n} // scope ensures close'
+            ]
+        },
+        "JavaScript": {
+            "unsafe": [
+                'const fs = require("fs");\nconst fd = fs.openSync("file.txt","r");\nconst buf = Buffer.alloc(128);\nfs.readSync(fd, buf, 0, 128, 0); // not closed'
+            ],
+            "safe": [
+                'const fs = require("fs");\ntry {\n  const fd = fs.openSync("file.txt","r");\n  const buf = Buffer.alloc(128);\n  fs.readSync(fd, buf, 0, 128, 0);\n  fs.closeSync(fd);\n} catch(e) {}'
+            ]
+        }
+    }
+}
+
+# ----------- PLACEHOLDER FILLING -----------
+
+# Map placeholder -> language hint for better names
+PLACEHOLDER_HINT = {
+    "buf":"c_family","dst":"c_family","src":"c_family",
+    "input":"generic","user_input":"generic","safe_data":"generic",
+    "cmd":"generic","ptr":"c_family","lst":"python","idx":"python",
+    "cursor":"python","stmt":"java","db":"js","f":"python",
+    "data":"generic","obj":"generic","x":"generic","val":"generic",
+    "fis":"java","fp":"c_family","ifs":"c_family",
+}
+
+def fill_placeholders(template, lang):
+    # find {...} and substitute
+    out = template
+    keys = set(part[1] for part in itertools.groupby(template, key=lambda c: c=='{'))
+    # simple scan:
+    token = ""
+    inside = False
+    found = []
+    for ch in template:
+        if ch == '{':
+            inside = True
+            token = ""
+        elif ch == '}' and inside:
+            inside = False
+            found.append(token)
+        elif inside:
+            token += ch
+    # replace each placeholder with a human-ish variable
+    for key in found:
+        hint = PLACEHOLDER_HINT.get(key, None)
+        name = pick_name({
+            "Python":"python",
+            "C":"c_family",
+            "C++":"c_family",
+            "Java":"java",
+            "JavaScript":"js"
+        }.get(lang, None))
+        out = out.replace("{"+key+"}", name)
+    return out
+
+# ----------- GENERATION -----------
+
+def make_short_variant(snippet, lang):
+    code = fill_placeholders(snippet, lang)
+    code = finalize_block(code, lang)
+    return code
+
+def make_long_variant(snippet, lang):
+    core = fill_placeholders(snippet, lang)
+    core = finalize_block(core, lang)
+    if lang == "Python":
+        return py_wrap_long(core)
+    if lang == "C":
+        return c_wrap_long(core, "C")
+    if lang == "C++":
+        return c_wrap_long(core, "C++")
+    if lang == "Java":
+        return java_wrap_long(core)
+    if lang == "JavaScript":
+        return js_wrap_long(core)
+    return core
+
+def generate_all():
+    dataset = []
+    for vuln, langs in TEMPLATES.items():
+        for lang, sets in langs.items():
+            for label in ("unsafe","safe"):
+                snippets = sets.get(label, []) 
+                for snip in snippets:
+                    # short variants
+                    for _ in range(SHORT_VARIANTS_PER_TEMPLATE):
+                        code = make_short_variant(snip, lang)
+                        dataset.append({
+                            "code": code,
+                            "language": lang,
+                            "error_name": vuln,
+                            "vulnerable": (label=="unsafe")
+                        })
+                    # long variants
+                    for _ in range(LONG_VARIANTS_PER_TEMPLATE):
+                        code = make_long_variant(snip, lang)
+                        dataset.append({
+                            "code": code,
+                            "language": lang,
+                            "error_name": vuln,
+                            "vulnerable": (label=="unsafe")
+                        })
+    return dataset
+
+if __name__ == "__main__":
+    data = generate_all()
+    with open(OUTPUT_JSONL, "w", encoding="utf-8") as f:
+        for row in data:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    print(f"Generated {len(data)} samples into {OUTPUT_JSONL}")
